@@ -13,9 +13,9 @@
 #include <io.h>
 #endif
 
-/* メモリサイズを 64KB に拡張 */
-#define TAPE_SIZE 65536
-#define MAX_FILE_SIZE 1048576 /* 1MB limit */
+// src/ref/vm.c の変更
+#define TAPE_SIZE 1048576          /* 1MB に拡張 */
+#define MAX_FILE_SIZE 1073741824   /* 1GB limit に拡張 */
 
 unsigned char tape[TAPE_SIZE];
 int ptr = 0;

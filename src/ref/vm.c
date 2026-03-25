@@ -1,30 +1,43 @@
-/* src/ref/vm.c -- fixed: execute SPA->BF as interpreter instead of dumping BF text */
-
+/* src/ref/vm.c -- Spaces VM: execute SPA->Spaces as interpreter */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h> /* isatty */
 #include <sys/types.h>
 #include <sys/stat.h>
-
 /* Windows-specific headers if needed */
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
 #endif
 
-// src/ref/vm.c の変更
-#define TAPE_SIZE 1048576          /* 1MB に拡張 */
-#define MAX_FILE_SIZE 1073741824   /* 1GB limit に拡張 */
+/* 64KB */
+#define TAPE_SIZE 65536
+#define MAX_FILE_SIZE 1048576 /* 1MB limit */
 
 unsigned char tape[TAPE_SIZE];
 int ptr = 0;
 
-/* Mapping: 3-bit code -> BF op (ASCII) */
-char op_map[8] = {'>', '<', '+', '-', '.', ',', '[', ']'};
+/* Spaces command set (3-bit encoding) */
+typedef enum {
+    SPC_RIGHT = 0,  /* > */
+    SPC_LEFT  = 1,  /* < */
+    SPC_INC   = 2,  /* + */
+    SPC_DEC   = 3,  /* - */
+    SPC_OUT   = 4,  /* . */
+    SPC_IN    = 5,  /* , */
+    SPC_LOOP_START = 6, /* [ */
+    SPC_LOOP_END  = 7, /* ] */
+} spaces_cmd_t;
+
+/* Mapping: 3-bit code -> Spaces command (internal code) */
+spaces_cmd_t op_map[8] = {
+    SPC_RIGHT, SPC_LEFT, SPC_INC, SPC_DEC,
+    SPC_OUT,   SPC_IN,   SPC_LOOP_START, SPC_LOOP_END
+};
 
 void panic(const char *msg) {
-    fprintf(stderr, "[VM Error] %s\n", msg);
+    fprintf(stderr, "Spaces VM Error: %s\n", msg);
     exit(1);
 }
 
@@ -37,16 +50,14 @@ int is_full_space(const unsigned char *s, int idx, int len) {
     return 0;
 }
 
-/* parse_line: convert line with spaces/full-width spaces into BF source (ASCII) */
-int parse_line(const char *input, int input_len, char *output, int max_out) {
+/* parse_line: convert line with spaces/full-width spaces into Spaces command stream */
+int parse_line(const char *input, int input_len, spaces_cmd_t *output, int max_out) {
     int out_idx = 0;
     int bit_buf = 0;
     int bit_cnt = 0;
-
     for (int i = 0; i < input_len && input[i] != 0; i++) {
         int bit = -1;
         unsigned char uc = (unsigned char)input[i];
-
         if (uc == 0x20) {
             bit = 0;
         } else if (uc == 0xE3) {
@@ -55,151 +66,142 @@ int parse_line(const char *input, int input_len, char *output, int max_out) {
                 i += 2; /* skip the remaining bytes of full-width space */
             }
         }
-
         if (bit != -1) {
             bit_buf = (bit_buf << 1) | (bit & 1);
             bit_cnt++;
             if (bit_cnt == 3) {
                 if (out_idx >= max_out - 1) panic("Output buffer overflow");
-                output[out_idx++] = (char)op_map[bit_buf & 0x7];
+                output[out_idx++] = op_map[bit_buf & 0x7];
                 bit_buf = 0;
                 bit_cnt = 0;
             }
         }
     }
-    output[out_idx] = 0;
     return out_idx;
 }
 
-/* Brainfuck runner -- unchanged except small safety checks */
-void run_bf(char *code) {
-    char *pc = code;
+/* Spaces VM runner -- directly interprets Spaces commands */
+void run_spaces(spaces_cmd_t *code, int code_len) {
+    int pc = 0;
     memset(tape, 0, sizeof(tape));
     ptr = 0;
 
-    while (*pc) {
-        switch (*pc) {
-            case '>':
+    /* Precompute loop pairs for efficiency */
+    int *loop_map = malloc(code_len * sizeof(int));
+    if (!loop_map) panic("Alloc fail for loop_map");
+    int stack[code_len]; /* rough upper bound */
+    int sp = 0;
+    for (int i = 0; i < code_len; i++) {
+        if (code[i] == SPC_LOOP_START) {
+            stack[sp++] = i;
+        } else if (code[i] == SPC_LOOP_END) {
+            if (sp == 0) panic("Unmatched SPC_LOOP_END");
+            int start = stack[--sp];
+            loop_map[start] = i;
+            loop_map[i] = start;
+        }
+    }
+    if (sp != 0) panic("Unmatched SPC_LOOP_START");
+
+    while (pc < code_len) {
+        switch (code[pc]) {
+            case SPC_RIGHT:
                 ptr++;
                 if (ptr >= TAPE_SIZE) panic("Tape pointer overflow (Right)");
                 break;
-            case '<':
+            case SPC_LEFT:
                 ptr--;
                 if (ptr < 0) panic("Tape pointer underflow (Left)");
                 break;
-            case '+':
+            case SPC_INC:
                 tape[ptr]++;
                 break;
-            case '-':
+            case SPC_DEC:
                 tape[ptr]--;
                 break;
-            case '.':
+            case SPC_OUT:
                 putchar(tape[ptr]);
                 break;
-            case ',':
-            {
-                int c = getchar();
-                tape[ptr] = (c == EOF) ? 0 : (unsigned char)c;
-                break;
-            }
-            case '[':
-                if (!tape[ptr]) {
-                    int loop = 1;
-                    while (loop > 0) {
-                        pc++;
-                        if (!*pc) panic("Unmatched '['");
-                        if (*pc == '[') loop++;
-                        if (*pc == ']') loop--;
-                    }
+            case SPC_IN:
+                {
+                    int c = getchar();
+                    tape[ptr] = (c == EOF) ? 0 : (unsigned char)c;
                 }
                 break;
-            case ']':
-                if (tape[ptr]) {
-                    int loop = 1;
-                    while (loop > 0) {
-                        if (pc == code) panic("Unmatched ']'");
-                        pc--;
-                        if (*pc == '[') loop--;
-                        if (*pc == ']') loop++;
-                    }
+            case SPC_LOOP_START:
+                if (tape[ptr] == 0) {
+                    pc = loop_map[pc];
+                }
+                break;
+            case SPC_LOOP_END:
+                if (tape[ptr] != 0) {
+                    pc = loop_map[pc];
                 }
                 break;
             default:
-                /* ignore other bytes */
+                /* ignore invalid codes (should not happen) */
                 break;
         }
         pc++;
     }
+    free(loop_map);
 }
 
 /* Helper: process an in-memory buffer that may be SPA header or spaces-encoded */
 void process_buffer(unsigned char *in, size_t n) {
-    /* allocate bc buffer */
-    size_t bc_cap = n + 128;
-    if (bc_cap < 4096) bc_cap = 4096;
-    char *bc = malloc(bc_cap);
-    if (!bc) panic("Alloc fail");
+    /* allocate command buffer */
+    size_t cmd_cap = n + 128;
+    if (cmd_cap < 4096) cmd_cap = 4096;
+    spaces_cmd_t *cmd = malloc(cmd_cap * sizeof(spaces_cmd_t));
+    if (!cmd) panic("Alloc fail");
 
     if (n >= 3 && in[0] == 'S' && in[1] == 'P' && in[2] == 'A') {
-        /* SPA binary format: map 1..8 -> bf ops */
+        /* SPA binary format: map 1..8 -> Spaces commands */
         size_t out_idx = 0;
         for (long i = 3; i < (long)n; i++) {
             unsigned char op = in[i];
-            char mapped = 0;
-            if (op >= 1 && op <= 8) mapped = op_map[op - 1];
-            if (mapped) bc[out_idx++] = mapped;
-            if (out_idx + 16 >= bc_cap) {
-                bc_cap *= 2;
-                char *tmp = realloc(bc, bc_cap);
-                if (!tmp) { free(bc); panic("Alloc fail"); }
-                bc = tmp;
+            if (op >= 1 && op <= 8) {
+                cmd[out_idx++] = op_map[op - 1];
+            }
+            if (out_idx + 16 >= cmd_cap) {
+                cmd_cap *= 2;
+                spaces_cmd_t *tmp = realloc(cmd, cmd_cap * sizeof(spaces_cmd_t));
+                if (!tmp) { free(cmd); panic("Alloc fail"); }
+                cmd = tmp;
             }
         }
-        bc[out_idx] = 0;
-
-        /* === CRITICAL FIX ===
-           Instead of dumping BF source to stdout, we must *execute* the BF program
-           (the compiler) so it will read stdin (the code to compile) and emit bytes
-           (compiled ELF) to stdout via '.' operations. */
-        run_bf(bc);
-
+        /* Execute the Spaces program */
+        run_spaces(cmd, (int)out_idx);
     } else {
-        /* spaces-encoded BF: parse whole input into bf string and run it */
-        int parsed = parse_line((const char*)in, (int)n, bc, (int)bc_cap);
+        /* spaces-encoded Spaces: parse whole input into command stream and run it */
+        int parsed = parse_line((const char*)in, (int)n, cmd, (int)cmd_cap);
         if (parsed > 0) {
-            run_bf(bc);
+            run_spaces(cmd, parsed);
         }
     }
-    free(bc);
+    free(cmd);
 }
 
 int main(int argc, char **argv) {
     /* Windows: force stdout binary if needed */
-    #ifdef _WIN32
+#ifdef _WIN32
     _setmode(_fileno(stdout), _O_BINARY);
-    #endif
+#endif
 
     if (argc > 1) {
-        /* file provided as argument: read whole file (this is the compiler BF) and execute it.
-           The compiler BF will read stdin (the source to compile) and write compiled bytes to stdout. */
+        /* file provided as argument: read whole file and execute it as Spaces program */
         FILE *f = fopen(argv[1], "rb");
         if (!f) { perror("File open error"); return 1; }
-
         if (fseek(f, 0, SEEK_END) != 0) { fclose(f); panic("fseek failed"); }
         long s = ftell(f);
         if (s < 0 || s > MAX_FILE_SIZE) { fclose(f); fprintf(stderr, "File too large\n"); return 1; }
         if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); panic("fseek failed"); }
-
         unsigned char *in = malloc((size_t)s + 1);
         if (!in) { fclose(f); panic("Alloc fail"); }
         size_t n = fread(in, 1, (size_t)s, f);
         fclose(f);
         in[n] = 0;
-
-        /* IMPORTANT: do NOT consume stdin here. The BF compiler (run_bf) will read from stdin
-           (which in the CI invocation is the vm.spaces piped into the process). */
         process_buffer(in, n);
-
         free(in);
         return 0;
     }
@@ -232,13 +234,14 @@ int main(int argc, char **argv) {
     }
 
     /* TTY interactive REPL */
-    fprintf(stderr, "Spaces REPL (Safe Mode)\n");
+    fprintf(stderr, "Spaces REPL (Spaces VM)\n");
     char line[4096];
-    char bc[4096];
+    spaces_cmd_t cmd_buf[4096];
     while (1) {
         if (!fgets(line, sizeof(line), stdin)) break;
-        if (parse_line(line, (int)strlen(line), bc, (int)sizeof(bc)) > 0) {
-            run_bf(bc);
+        int parsed = parse_line(line, (int)strlen(line), cmd_buf, (int)(sizeof(cmd_buf)/sizeof(cmd_buf[0])));
+        if (parsed > 0) {
+            run_spaces(cmd_buf, parsed);
             printf("\n");
         }
     }
